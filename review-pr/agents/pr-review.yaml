@@ -125,13 +125,14 @@ agents:
            explaining the diff would be empty (the user may be on the default branch),
            then stop calling tools.
            In both abort cases do NOT use `[ ... ]` tests or `exit 1`.
-      2. **Read project conventions**: Try to read `AGENTS.md` from the repo root with
-         `read_file`. If it does not exist, try `CLAUDE.md`. If neither exists, skip this
-         step and proceed without project context. Do not use `ls ... 2>/dev/null` — that
-         is bash-only. This file contains project-specific context such as language versions,
-         build tools, coding conventions, and other guidelines that MUST inform the review.
-         Pass its contents to both the drafter and verifier as `project_context` in their
-         delegation messages.
+      2. **Read project conventions** for the verifier delegation:
+         - **GitHub posting mode**: Read `/tmp/project_context.txt` (pre-written by CI).
+           If empty, proceed without project context.
+         - **Console mode**: Try to read `AGENTS.md` from the repo root with `read_file`.
+           If it does not exist, try `CLAUDE.md`. If neither exists, proceed without context.
+         This file contains project-specific context such as language versions, build tools,
+         and coding conventions. Pass its contents to the **verifier** delegation only —
+         the drafter receives project context via its input JSON file, not the task string.
       3. Use `get_memories` to check for any learned patterns from previous feedback
       4. **Delegate to drafter(s)**:
          **GitHub posting mode** (GITHUB_ACTIONS=true):
@@ -160,28 +161,29 @@ agents:
 
          ## CRITICAL: How to delegate to the drafter
 
-         Do NOT paste diffs inline — `transfer_task` has a size limit and will truncate.
-         Tell the drafter the diff file path; it will `read_file` from disk.
+         Each delegation task string MUST contain only the diff path and context file path.
+         Do NOT describe the drafter's output format or field names — the drafter has its
+         own schema. Describing field names in the task string triggers schema validation
+         failures and causes a file-read retry loop.
 
-         Each delegation message must include:
-         - Diff file path (CI: `/tmp/drafter_chunk_N.diff`; console: `./pr-review.diff`)
-         - Project context: contents of AGENTS.md (or "none")
-         - Risk scores: contents of `/tmp/file_risk_scores.json` (CI mode only — skip in console mode)
-         - File history: relevant entries from `/tmp/file_history.txt` (CI mode only — skip in console mode)
-         - Available files: run `ls` on directories of changed files so drafter knows real paths
-         - Learned patterns: any relevant memories
+         **GitHub posting mode**: The CI workflow pre-writes
+         `/tmp/drafter_chunk_N_input.json` for each chunk N. The task string is:
+         ```
+         /tmp/drafter_chunk_N.diff /tmp/drafter_chunk_N_input.json
+         ```
+         (Replace N with the chunk number. Append any learned patterns as plain text after.)
 
-         **CRITICAL — drafter response schema (schema-validated, strict):**
-         The drafter returns a JSON object with these exact top-level fields:
-         - `findings`: array of objects with fields `file`, `line`, `severity`, `category`,
-           `issue` (one-line summary), `details` (trigger + impact), `in_diff` (boolean)
-         - `summary`: string — overall assessment
-         - `review_complete`: boolean — true if the full chunk was reviewed
-
-         **NEVER mention `title` or `body` as finding field names in the delegation
-         message.** Those fields do not exist in the drafter schema. If the task string
-         asks for `title`/`body`, the schema validator rejects every emit attempt and the
-         drafter enters an infinite file-read retry loop. Always use `issue` and `details`.
+         **Console mode**: Write `/tmp/drafter_input.json` with:
+         ```bash
+         jq -n \
+           --arg diff_path "./pr-review.diff" \
+           --arg project_context "<AGENTS.md contents or empty>" \
+           --arg refs_dir "" \
+           '{diff_path:$diff_path,project_context:$project_context,refs_dir:$refs_dir}' \
+           > /tmp/drafter_input.json
+         ```
+         Then use task string: `./pr-review.diff /tmp/drafter_input.json`
+         (Append any learned patterns as plain text after.)
       5. Parse the drafter's JSON response. If the response is empty, not valid JSON, or
          an error message, treat it as
          `{"findings": [], "summary": "Drafter did not complete", "review_complete": false}`.
@@ -359,30 +361,29 @@ agents:
       code is correct. For example, a project using Go 1.25+ has access to APIs that older
       versions lack. Always ground your analysis in the project's actual configuration.
 
-      ## CRITICAL: How to Get the Diff
+      ## CRITICAL: How to Start
 
-      The orchestrator provides a file path to the diff (CI mode:
-      `/tmp/drafter_chunk_N.diff`; console mode: `./pr-review.diff`).
-      Use `read_file` to read that path — it contains the unified diff you must analyze.
+      Your task message contains two file paths separated by a space, followed by optional
+      learned patterns: `<diff_path> <input_json_path> [patterns...]`
 
-      If the orchestrator's message contains a file path, read it FIRST before doing anything
-      else. If the file is not found, return this exact response immediately:
+      **Step 1**: Read the context JSON file (the second path, ending in `_input.json`).
+      It contains: `diff_path`, `project_context`, `risk_scores`, `file_history`, `refs_dir`.
+
+      **Step 2**: Read the diff file at the `diff_path` from the context JSON.
+
+      If either file is not found, return immediately:
       ```json
-      {"findings": [], "summary": "ERROR: Diff file not found at the specified path. The orchestrator must write the diff to disk before delegating."}
+      {"findings": [], "summary": "ERROR: Input or diff file not found.", "review_complete": false}
       ```
 
-      Do NOT guess other file paths or search the filesystem for the diff. Read the ONE path
-      the orchestrator gave you, or return the error above.
+      Do NOT read any other files before completing these two steps.
 
       ## Domain-Specific Review Guides
 
-      After reading the diff, check the domain-refs directory for review guides
-      (any .md file other than posting-format.md). The directory depends on mode:
-      - GitHub posting mode (GITHUB_ACTIONS=true) → `/tmp/refs/` (always present)
-      - Console mode (GITHUB_ACTIONS empty/unset) → not bundled. Try `/refs/` only
-        as a best-effort — it usually does not exist. If neither directory exists
-        or `list_directory` returns an error, skip domain-specific guidance entirely
-        and produce only standard findings JSON.
+      After reading the diff, check the `refs_dir` field from your context JSON for domain
+      review guides (any .md file other than posting-format.md). If `refs_dir` is empty or
+      the directory does not exist, skip domain-specific guidance and produce only standard
+      findings JSON.
       For each guide that does load, read its "When this guide applies" section
       and check the trigger patterns against the diff content (e.g., import paths,
       SDK usage patterns). If a guide applies, follow its checklist and include its
