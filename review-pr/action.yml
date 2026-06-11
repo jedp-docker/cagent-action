@@ -377,6 +377,40 @@ runs:
         ENTRIES=$(grep -c '^## ' /tmp/file_history.txt 2>/dev/null || echo "0")
         echo "✅ Generated history for $ENTRIES file(s)"
 
+    - name: Prepare drafter input files
+      if: hashFiles('pr.diff') != ''
+      shell: bash
+      env:
+        CHUNK_COUNT: ${{ steps.chunk-diff.outputs.chunk_count }}
+      run: |
+        set -euo pipefail
+
+        # Read project context (AGENTS.md or CLAUDE.md from the PR's repo)
+        PROJECT_CONTEXT=""
+        if [ -f AGENTS.md ]; then
+          PROJECT_CONTEXT=$(cat AGENTS.md)
+        elif [ -f CLAUDE.md ]; then
+          PROJECT_CONTEXT=$(cat CLAUDE.md)
+        fi
+
+        # Write project context for the verifier delegation
+        printf '%s' "$PROJECT_CONTEXT" > /tmp/project_context.txt
+
+        RISK_SCORES=$(cat /tmp/file_risk_scores.json 2>/dev/null || echo '{}')
+        FILE_HISTORY=$(cat /tmp/file_history.txt 2>/dev/null || echo '')
+
+        for i in $(seq 1 "${CHUNK_COUNT:-1}"); do
+          jq -n \
+            --arg diff_path "/tmp/drafter_chunk_${i}.diff" \
+            --arg project_context "$PROJECT_CONTEXT" \
+            --argjson risk_scores "$RISK_SCORES" \
+            --arg file_history "$FILE_HISTORY" \
+            --arg refs_dir "/tmp/refs" \
+            '{diff_path:$diff_path,project_context:$project_context,risk_scores:$risk_scores,file_history:$file_history,refs_dir:$refs_dir}' \
+            > /tmp/drafter_chunk_${i}_input.json
+          echo "✅ Wrote /tmp/drafter_chunk_${i}_input.json"
+        done
+
     - name: Resolve stale review threads
       if: steps.lock-check.outputs.skip != 'true'
       continue-on-error: true
